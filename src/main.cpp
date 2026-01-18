@@ -1,73 +1,83 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
-#include <TinyGPS++.h>
-#include <Firebase_ESP_Client.h>
-
-
-// --- BROWNOUT PROTECTION ---
-// Disables the voltage drop detector to prevent reboot loops during WiFi connection
+#include <ArduinoJson.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// ========================================== 
+// ==========================================
 // 1. CONFIGURATION
 // ==========================================
-const char* ssid     = "********";    //fill in yours credentials
-const char* password = "********"; 
+const char* ssid     = "HALNy-2.4G-8228b4";    
+const char* password = "H55Luw8HLw"; 
+String thingSpeakApiKey = "EW9MCXI8KVWNMQFU"; 
 
-#define API_KEY "AIzaSyCVEoqI3jtOk0RxIWA3iz3CQZ22bpIBLgw"
-#define DATABASE_URL "https://esp32-group2-417e0-default-rtdb.europe-west1.firebasedatabase.app/" 
+// --- LOCATION: GDANSK (City Center) ---
+float fixedLat = 54.3520; 
+float fixedLng = 18.6466; 
 
 // ==========================================
-// 2. HARDWARE PINS (CYD ESP32-2432S028)
+// 2. HARDWARE SETUP
 // ==========================================
 #define XPT_CS   33 
 #define XPT_MOSI 32
 #define XPT_MISO 39
 #define XPT_CLK  25
-#define RXD2 22
-#define TXD2 27
+#define CYD_LED_RED   4
+#define CYD_LED_GREEN 16
+#define CYD_LED_BLUE  17
 
 XPT2046_Touchscreen touchscreen(XPT_CS); 
 SPIClass touchSPI(HSPI);
 TFT_eSPI tft = TFT_eSPI();
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);
 
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
-
+// ==========================================
+// 3. UI VARIABLES
+// ==========================================
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
 uint32_t draw_buf[SCREEN_WIDTH * SCREEN_HEIGHT / 10];
 
-// UI Objects
-lv_obj_t * label_status; 
-lv_obj_t * label_wifi_icon;
-lv_obj_t * label_gps;    
-lv_obj_t * label_air;    
+lv_obj_t * lbl_status_header;
+lv_obj_t * lbl_lat_val;
+lv_obj_t * lbl_lng_val;
+lv_obj_t * lbl_info_mode;
 
-// Logic Flags
-bool wifiStarted = false;
-unsigned long startupTimer = 0;
-bool firebaseReady = false;
-unsigned long lastSend = 0;
-int airQuality = 50; 
+lv_obj_t * lbl_temp_big;
+lv_obj_t * lbl_press_val;
+
+lv_obj_t * lbl_pm25;
+lv_obj_t * lbl_pm10;
+lv_obj_t * lbl_no2;
+lv_obj_t * lbl_so2;
+lv_obj_t * lbl_o3;
+lv_obj_t * lbl_co;
+lv_obj_t * bar_summary;
+
+float valTemp = 0.0;
+int valPM25 = 0;
+unsigned long lastUpdateTimestamp = 0;
+unsigned long updateInterval = 60000; // Every 60 seconds
 
 // ==========================================
-// 3. TOUCHPAD DRIVER
+// 4. HELPER FUNCTIONS
 // ==========================================
+void setLedColor(bool r, bool g, bool b) {
+    // CYD LEDs are usually active LOW
+    digitalWrite(CYD_LED_RED,   r ? LOW : HIGH);
+    digitalWrite(CYD_LED_GREEN, g ? LOW : HIGH);
+    digitalWrite(CYD_LED_BLUE,  b ? LOW : HIGH);
+}
+
 void my_touchpad_read(lv_indev_t * indev, lv_indev_data_t * data) {
     if(touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();
-        // Calibration (based on your device)
-        int tx = map(p.x, 314, 3603, 0, SCREEN_WIDTH);
-        int ty = map(p.y, 417, 3637, 0, SCREEN_HEIGHT);
+        int tx = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
+        int ty = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
         tx = constrain(tx, 0, SCREEN_WIDTH - 1);
         ty = constrain(ty, 0, SCREEN_HEIGHT - 1);
         data->state = LV_INDEV_STATE_PRESSED;
@@ -89,198 +99,208 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
 }
 
 // ==========================================
-// 4. GUI CREATION
+// 5. GUI SETUP (NO BUTTON)
 // ==========================================
 void create_gui() {
-    // Red Cursor (Debug)
-    lv_obj_t * cursor_obj = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(cursor_obj, 10, 10);
-    lv_obj_set_style_bg_color(cursor_obj, lv_color_hex(0xFF0000), 0);
-    lv_obj_set_style_radius(cursor_obj, LV_RADIUS_CIRCLE, 0);
-    lv_obj_remove_flag(cursor_obj, LV_OBJ_FLAG_CLICKABLE);
-    lv_indev_t * indev = lv_indev_get_next(NULL);
-    if(indev) lv_indev_set_cursor(indev, cursor_obj);
-
-    // Tabview
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x101010), 0);
     lv_obj_t * tabview = lv_tabview_create(lv_screen_active());
     lv_tabview_set_tab_bar_position(tabview, LV_DIR_TOP);
-    lv_obj_set_height(lv_tabview_get_tab_bar(tabview), 40);
 
-    lv_obj_t * t1 = lv_tabview_add_tab(tabview, "GPS Data");
-    lv_obj_t * t2 = lv_tabview_add_tab(tabview, "Air Qual");
-    lv_obj_t * t3 = lv_tabview_add_tab(tabview, "System");
+    lv_obj_t * t1 = lv_tabview_add_tab(tabview, "SYSTEM");
+    lv_obj_t * t2 = lv_tabview_add_tab(tabview, "AIR QUAL");
+    lv_obj_t * t3 = lv_tabview_add_tab(tabview, "WEATHER");
 
-    // Top Bar Elements
-    label_wifi_icon = lv_label_create(lv_layer_top());
-    lv_label_set_text(label_wifi_icon, LV_SYMBOL_WIFI);
-    lv_obj_align(label_wifi_icon, LV_ALIGN_TOP_RIGHT, -10, 5);
-    lv_obj_set_style_text_color(label_wifi_icon, lv_color_hex(0x555555), 0); // Gray init
+    // --- SYSTEM TAB ---
+    lbl_status_header = lv_label_create(t1);
+    lv_label_set_text(lbl_status_header, "WiFi: ... | Mode: STATIC (Gdansk)");
+    lv_obj_align(lbl_status_header, LV_ALIGN_TOP_MID, 0, 5);
 
-    label_status = lv_label_create(lv_layer_top());
-    lv_label_set_text(label_status, "System Init...");
-    lv_obj_align(label_status, LV_ALIGN_BOTTOM_MID, 0, -5);
-    lv_obj_set_style_bg_color(label_status, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(label_status, LV_OPA_50, 0);
-
-    // Tab 1: GPS
-    label_gps = lv_label_create(t1);
-    lv_label_set_text(label_gps, "GPS Waiting...");
-    lv_obj_center(label_gps);
+    lv_obj_t * panel_gps = lv_obj_create(t1);
+    lv_obj_set_size(panel_gps, 280, 90);
+    lv_obj_align(panel_gps, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_style_bg_color(panel_gps, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_border_color(panel_gps, lv_palette_main(LV_PALETTE_GREEN), 0); 
     
-    // Tab 2: Air
-    label_air = lv_label_create(t2);
-    lv_label_set_text(label_air, "Sensor Init...");
-    lv_obj_center(label_air);
+    lbl_lat_val = lv_label_create(panel_gps);
+    lv_label_set_text(lbl_lat_val, ("LAT: " + String(fixedLat, 4)).c_str());
+    lv_obj_align(lbl_lat_val, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_style_text_color(lbl_lat_val, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lbl_lat_val, &lv_font_montserrat_20, 0);
+
+    lbl_lng_val = lv_label_create(panel_gps);
+    lv_label_set_text(lbl_lng_val, ("LNG: " + String(fixedLng, 4)).c_str());
+    lv_obj_align(lbl_lng_val, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_text_color(lbl_lng_val, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lbl_lng_val, &lv_font_montserrat_20, 0);
+
+    lbl_info_mode = lv_label_create(t1);
+    lv_label_set_text(lbl_info_mode, "Loc Source: HARDCODED\nAuto-Update: Every 60s");
+    lv_obj_align(lbl_info_mode, LV_ALIGN_TOP_LEFT, 10, 140);
+    lv_obj_set_style_text_color(lbl_info_mode, lv_palette_main(LV_PALETTE_GREY), 0);
+
+    // --- AIR TAB ---
+    lbl_pm25 = lv_label_create(t2); lv_label_set_text(lbl_pm25, "PM 2.5: --"); lv_obj_align(lbl_pm25, LV_ALIGN_TOP_LEFT, 10, 20);
+    lbl_pm10 = lv_label_create(t2); lv_label_set_text(lbl_pm10, "PM 10:  --"); lv_obj_align(lbl_pm10, LV_ALIGN_TOP_LEFT, 10, 50);
+    lbl_no2  = lv_label_create(t2); lv_label_set_text(lbl_no2,  "NO2: --");    lv_obj_align(lbl_no2, LV_ALIGN_TOP_RIGHT, -10, 20);
+    lbl_o3   = lv_label_create(t2); lv_label_set_text(lbl_o3,   "O3:  --");    lv_obj_align(lbl_o3, LV_ALIGN_TOP_RIGHT, -10, 45);
+    lbl_so2  = lv_label_create(t2); lv_label_set_text(lbl_so2,  "SO2: --");    lv_obj_align(lbl_so2, LV_ALIGN_TOP_RIGHT, -10, 70);
+    lbl_co   = lv_label_create(t2); lv_label_set_text(lbl_co,   "CO:  --");    lv_obj_align(lbl_co, LV_ALIGN_TOP_RIGHT, -10, 95);
     
-    // Tab 3: System
-    lv_obj_t * lbl = lv_label_create(t3);
-    lv_label_set_text(lbl, "ESP32 CYD Tracker\nEngineering Project\n\n(c) 2024");
-    lv_obj_center(lbl);
+    bar_summary = lv_bar_create(t2); 
+    lv_obj_set_size(bar_summary, 260, 15); 
+    lv_obj_align(bar_summary, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    // --- WEATHER TAB ---
+    lbl_temp_big = lv_label_create(t3); lv_label_set_text(lbl_temp_big, "-- C"); lv_obj_center(lbl_temp_big);
+    lv_obj_set_style_text_font(lbl_temp_big, &lv_font_montserrat_48, 0);
+    lbl_press_val = lv_label_create(t3); lv_label_set_text(lbl_press_val, "Pressure: --"); lv_obj_align(lbl_press_val, LV_ALIGN_BOTTOM_MID, 0, -30);
 }
 
 // ==========================================
-// 5. SETUP
+// 6. DATA FETCHING LOGIC (ZERO VALUE FIX)
 // ==========================================
+void syncData() {
+    if(WiFi.status() != WL_CONNECTED) {
+        setLedColor(true, false, false); // RED - Error
+        lv_label_set_text(lbl_status_header, "WiFi: ERROR");
+        return;
+    }
+
+    setLedColor(false, false, true); // BLUE - Working
+    HTTPClient http;
+    JsonDocument doc; 
+
+    
+
+    // -----------------------------------------
+    // STEP 1: FETCH WEATHER (api.open-meteo.com)
+    // -----------------------------------------
+    String urlWeather = "http://api.open-meteo.com/v1/forecast?latitude=" + String(fixedLat, 4) + 
+                        "&longitude=" + String(fixedLng, 4) + 
+                        "&current=temperature_2m,surface_pressure";
+
+    http.begin(urlWeather);
+    if (http.GET() == 200) {
+        deserializeJson(doc, http.getString());
+        float temp  = doc["current"]["temperature_2m"];
+        float press = doc["current"]["surface_pressure"];
+        
+        valTemp = temp; // Save globally
+        
+        // Update Weather UI
+        lv_label_set_text(lbl_temp_big, (String(temp, 1) + " C").c_str());
+        lv_label_set_text(lbl_press_val, ("Pressure: " + String(press, 0) + " hPa").c_str());
+    }
+    http.end();
+    
+    doc.clear(); // Clear buffer
+
+    // -----------------------------------------
+    // STEP 2: FETCH AIR QUALITY (air-quality-api.open-meteo.com)
+    // Crucial: Dedicated server for pollutants!
+    // -----------------------------------------
+    String urlAir = "http://air-quality-api.open-meteo.com/v1/air-quality?latitude=" + String(fixedLat, 4) + 
+                    "&longitude=" + String(fixedLng, 4) + 
+                    "&current=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone";
+
+    http.begin(urlAir);
+    if (http.GET() == 200) {
+        deserializeJson(doc, http.getString());
+        
+        // Read as float to avoid data loss
+        float pm25 = doc["current"]["pm2_5"];
+        float pm10 = doc["current"]["pm10"];
+        float no2  = doc["current"]["nitrogen_dioxide"];
+        float so2  = doc["current"]["sulphur_dioxide"];
+        float o3   = doc["current"]["ozone"];
+        float co   = doc["current"]["carbon_monoxide"];
+
+        valPM25 = (int)pm25; // Save globally
+
+        // Update Air UI
+        lv_label_set_text(lbl_pm25, ("PM 2.5: " + String(pm25, 0)).c_str());
+        lv_label_set_text(lbl_pm10, ("PM 10:  " + String(pm10, 0)).c_str());
+        lv_label_set_text(lbl_no2,  ("NO2: " + String(no2, 1)).c_str());
+        lv_label_set_text(lbl_so2,  ("SO2: " + String(so2, 1)).c_str());
+        lv_label_set_text(lbl_o3,   ("O3:  " + String(o3, 1)).c_str());
+        lv_label_set_text(lbl_co,   ("CO:  " + String(co, 1)).c_str());
+
+        // Bar Color Logic
+        lv_bar_set_value(bar_summary, (int)pm25, LV_ANIM_ON);
+        if(pm25 < 25) lv_obj_set_style_bg_color(bar_summary, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+        else lv_obj_set_style_bg_color(bar_summary, lv_palette_main(LV_PALETTE_RED), LV_PART_INDICATOR);
+    }
+    http.end();
+
+    // -----------------------------------------
+    // STEP 3: UPLOAD TO THINGSPEAK
+    // -----------------------------------------
+    String tsUrl = "http://api.thingspeak.com/update?api_key=" + thingSpeakApiKey + 
+                   "&field1=" + String(fixedLat, 5) + 
+                   "&field2=" + String(fixedLng, 5) + 
+                   "&field3=" + String(valPM25) +
+                   "&field4=" + String(valTemp);
+    http.begin(tsUrl);
+    http.GET();
+    http.end();
+
+    setLedColor(false, true, false); // GREEN - Success
+    lastUpdateTimestamp = millis();
+    lv_label_set_text(lbl_status_header, "WiFi: OK | Gdansk (Updated)");
+}
+
+// ==========================================
+// 7. SETUP & LOOP
+// ==========================================
+hw_timer_t * lvgl_timer = NULL;
+void IRAM_ATTR onTimer() { lv_tick_inc(5); }
+
 void setup() {
-    // CRITICAL: Disable brownout detector to prevent reboots on USB power
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
     Serial.begin(115200);
-    gpsSerial.begin(9600, SERIAL_8N1, RXD2, TXD2);
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.setSwapBytes(true);
+    // LED Setup
+    pinMode(CYD_LED_RED, OUTPUT); pinMode(CYD_LED_GREEN, OUTPUT); pinMode(CYD_LED_BLUE, OUTPUT);
+    setLedColor(true, false, false); // Start RED
 
-    touchSPI.begin(XPT_CLK, XPT_MISO, XPT_MOSI, XPT_CS);
-    touchscreen.begin(touchSPI);
-    touchscreen.setRotation(1);
+    // Screen Setup
+    tft.begin(); tft.setRotation(1); tft.setSwapBytes(true);
+    touchSPI.begin(XPT_CLK, XPT_MISO, XPT_MOSI, XPT_CS); touchscreen.begin(touchSPI); touchscreen.setRotation(1);
 
+    // LVGL Setup
     lv_init();
     lv_display_t * disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
     lv_display_set_flush_cb(disp, my_disp_flush);
     lv_display_set_buffers(disp, draw_buf, NULL, sizeof(draw_buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
-
     lv_indev_t * indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touchpad_read);
 
+    // Timer Interrupt
+    lvgl_timer = timerBegin(0, 80, true);
+    timerAttachInterrupt(lvgl_timer, &onTimer, true);
+    timerAlarmWrite(lvgl_timer, 5000, true);
+    timerAlarmEnable(lvgl_timer);
+
     create_gui();
-    startupTimer = millis();
+
+    // WiFi Start
+    WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_11dBm);
+    WiFi.begin(ssid, password);
 }
 
-// ==========================================
-// 6. LOOP
-// ==========================================
 void loop() {
-    lv_task_handler(); 
-    lv_tick_inc(5); 
+    lv_task_handler();
 
-    // --- 1. SAFE STARTUP (Delay WiFi by 4s) ---
-    if (!wifiStarted && millis() - startupTimer > 4000) {
-        wifiStarted = true;
-        lv_label_set_text(label_status, "WiFi Connecting...");
-        
-        WiFi.mode(WIFI_STA);
-        // Reduced TX Power to avoid voltage drops
-        WiFi.setTxPower(WIFI_POWER_11dBm); 
-        WiFi.begin(ssid, password);
+    // Sync on first connection
+    if (WiFi.status() == WL_CONNECTED && lastUpdateTimestamp == 0) {
+        syncData();
     }
 
-    // --- 2. WIFI MANAGER ---
-    if (wifiStarted) {
-        static unsigned long lastCheck = 0;
-        if (millis() - lastCheck > 1000) {
-            lastCheck = millis();
-            
-            if (WiFi.status() == WL_CONNECTED) {
-                lv_obj_set_style_text_color(label_wifi_icon, lv_color_hex(0x00FF00), 0);
-                
-                if (!firebaseReady) {
-                    config.api_key = API_KEY;
-                    config.database_url = DATABASE_URL;
-                    fbdo.setResponseSize(4096);
-                    config.timeout.wifiReconnect = 10000;
-                    
-                    Firebase.signUp(&config, &auth, "", "");
-                    Firebase.begin(&config, &auth);
-                    Firebase.reconnectWiFi(true);
-                    firebaseReady = true;
-                    lv_label_set_text(label_status, "System ONLINE");
-                }
-            } else {
-                 lv_obj_set_style_text_color(label_wifi_icon, lv_color_hex(0xFF0000), 0);
-            }
-        }
-    }
-
-    // --- 3. GPS READ ---
-    while (gpsSerial.available() > 0) {
-        gps.encode(gpsSerial.read());
-    }
-
-    // --- 4. MAIN LOGIC (Every 5s) ---
-    if (millis() - lastSend > 5000) {
-        lastSend = millis();
-
-        // Simulated Air Data
-        airQuality += random(-5, 6);
-        if(airQuality < 0) airQuality = 0;
-        
-        float lat = 0.0;
-        float lng = 0.0;
-        int sats = 0;
-        bool validGPS = false;
-
-        // GPS Check
-        if (gps.location.isValid()) {
-            lat = gps.location.lat();
-            lng = gps.location.lng();
-            sats = gps.satellites.value();
-            validGPS = true;
-            
-            // Safe String Concatenation (fixes compilation errors)
-            String g_txt = "Lat: ";
-            g_txt += String(lat, 6);
-            g_txt += "\nLon: ";
-            g_txt += String(lng, 6);
-            g_txt += "\nSats: ";
-            g_txt += sats;
-            
-            lv_label_set_text(label_gps, g_txt.c_str());
-        } else {
-             lv_label_set_text(label_gps, "Searching Satellites...\n(Go outside)");
-        }
-
-        // Air Data Display
-        String a_txt = "PM 2.5: ";
-        a_txt += airQuality;
-        a_txt += " ug/m3\nStatus: ";
-        if(airQuality < 20) {
-            a_txt += "Good";
-            lv_obj_set_style_text_color(label_air, lv_color_hex(0x00FF00), 0); 
-        } else {
-            a_txt += "Moderate";
-            lv_obj_set_style_text_color(label_air, lv_color_hex(0xFFFF00), 0); 
-        }
-        lv_label_set_text(label_air, a_txt.c_str());
-
-        // Send to Cloud (Only if GPS Fix is Valid)
-        if (firebaseReady && validGPS) {
-            lv_label_set_text(label_status, "Sending data...");
-            
-            FirebaseJson json;
-            json.set("lat", lat);
-            json.set("lng", lng);
-            json.set("air", airQuality);
-            json.set("ts", millis());
-
-            if (Firebase.RTDB.pushJSON(&fbdo, "/routes", &json)) {
-                lv_label_set_text(label_status, "Saved to Cloud");
-            } else {
-                lv_label_set_text(label_status, "DB Error");
-            }
-        }
+    // Timer Sync
+    if (millis() - lastUpdateTimestamp > updateInterval) {
+        syncData();
     }
     
     delay(5);
